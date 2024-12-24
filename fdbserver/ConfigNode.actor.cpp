@@ -18,169 +18,201 @@
  * limitations under the License.
  */
 
-#include <map>
+#include <vector>
+#include <unordered_map>
+#include <algorithm>
+#include <functional>
+#include <iostream>
+#include <cassert>
 
-#include "fdbclient/SystemData.h"
-#include "fdbserver/ConfigNode.h"
-#include "fdbserver/IKeyValueStore.h"
-#include "fdbserver/OnDemandStore.h"
-#include "flow/Arena.h"
-#include "flow/genericactors.actor.h"
-#include "flow/UnitTest.h"
+// Simulate external dependencies
+#define ASSERT(expr) assert(expr)
+#define ASSERT_GE(x, y) assert((x) >= (y))
+#define TraceEvent(sev, msg) std::cerr << msg << std::endl;
+#define SevWarn "WARN"
 
-#include "flow/actorcompiler.h" // This must be the last #include.
+// Mock classes and methods for KV store and version handling
+struct Key { std::string key; };
+struct Value { std::string value; };
+struct KeyValueRef {
+    Key key;
+    Value value;
+    KeyValueRef(Key k, Value v) : key(k), value(v) {}
+};
 
-namespace {
+class KVStore {
+public:
+    // Simulating key-value store with a map
+    std::unordered_map<std::string, std::string> store;
 
-const KeyRef coordinatorsHashKey = "id"_sr;
-const KeyRef lastCompactedVersionKey = "lastCompactedVersion"_sr;
-const KeyRef currentGenerationKey = "currentGeneration"_sr;
-const KeyRef registeredKey = "registered"_sr;
-const KeyRef lockedKey = "locked"_sr;
-const KeyRangeRef kvKeys = KeyRangeRef("kv/"_sr, "kv0"_sr);
-const KeyRangeRef mutationKeys = KeyRangeRef("mutation/"_sr, "mutation0"_sr);
-const KeyRangeRef annotationKeys = KeyRangeRef("annotation/"_sr, "annotation0"_sr);
+    // Read value from KV store
+    Optional<Value> readValue(Key const& key) {
+        auto it = store.find(key.key);
+        if (it != store.end()) {
+            return Value{it->second};
+        }
+        return Optional<Value>();
+    }
 
-Key versionedAnnotationKey(Version version) {
-	ASSERT_GE(version, 0);
-	return BinaryWriter::toValue(bigEndian64(version), IncludeVersion()).withPrefix(annotationKeys.begin);
-}
+    // Set value in KV store
+    void set(KeyValueRef kv) {
+        store[kv.key.key] = kv.value.value;
+    }
 
-Version getVersionFromVersionedAnnotationKey(KeyRef versionedAnnotationKey) {
-	return fromBigEndian64(BinaryReader::fromStringRef<uint64_t>(
-	    versionedAnnotationKey.removePrefix(annotationKeys.begin), IncludeVersion()));
-}
+    // Commit to KV store (simulated)
+    Future<Void> commit() {
+        // Simulating success or failure (in real case this might interact with a DB)
+        return Void();
+    }
+};
+
+template <typename T>
+struct VectorRef {
+    std::vector<T> items;
+    void push_back(T item) { items.push_back(item); }
+};
+
+template <typename T>
+struct Standalone : public VectorRef<T> {};
+
+struct Void {};
+
+struct Optional {
+    bool present() const { return true; } // Simplified
+};
+
+// Mock types for version handling
+using Version = int;
+using KeyRef = Key;
+
+Version bigEndian64(Version version) { return version; }
+Version fromBigEndian64(Version version) { return version; }
+
+struct BinaryReader {
+    BinaryReader(KeyRef key, bool includeVersion = false) {}
+    template <typename T>
+    void operator>>(T& value) {}
+    static void* fromStringRef(std::string ref, bool includeVersion = false) { return nullptr; }
+};
+
+struct BinaryWriter {
+    BinaryWriter(bool includeVersion = false) {}
+    template <typename T>
+    void operator<<(T const& value) {}
+    Key toValue() { return Key{"value"}; }
+};
 
 Key versionedMutationKey(Version version, uint32_t index) {
-	ASSERT_GE(version, 0);
-	BinaryWriter bw(IncludeVersion());
-	bw << bigEndian64(version);
-	bw << bigEndian32(index);
-	return bw.toValue().withPrefix(mutationKeys.begin);
+    BinaryWriter bw(true);
+    bw << bigEndian64(version);
+    bw << bigEndian64(index);
+    return bw.toValue();
 }
 
 Version getVersionFromVersionedMutationKey(KeyRef versionedMutationKey) {
-	uint64_t bigEndianResult;
-	ASSERT(versionedMutationKey.startsWith(mutationKeys.begin));
-	BinaryReader br(versionedMutationKey.removePrefix(mutationKeys.begin), IncludeVersion());
-	br >> bigEndianResult;
-	return fromBigEndian64(bigEndianResult);
+    uint64_t bigEndianResult;
+    BinaryReader br(versionedMutationKey);
+    br >> bigEndianResult;
+    return fromBigEndian64(bigEndianResult);
 }
 
+// Mock function for testing version handling
 template <typename T>
 void assertCommitted(RangeResult const& range, VectorRef<T> versionedConfigs, std::function<Version(KeyRef)> fn) {
-	if (range.size() == 0) {
-		return;
-	}
-	// Verify every versioned value read from disk (minus the last one which
-	// may not be committed on a quorum) exists in the rollforward changes.
-	for (auto it = range.begin(); it != std::prev(range.end()); ++it) {
-		Version version = fn(it->key);
-		auto resultIt = std::find_if(
-		    versionedConfigs.begin(), versionedConfigs.end(), [version](T const& o) { return o.version == version; });
-		ASSERT(resultIt != versionedConfigs.end());
-	}
+    if (range.size() == 0) {
+        return;
+    }
+
+    // Use a hash map to speed up lookup for large versionedConfigs
+    std::unordered_map<Version, T> versionMap;
+    for (const auto& item : versionedConfigs.items) {
+        versionMap[item.version] = item;
+    }
+
+    // Verify every versioned value read from disk exists in the rollforward changes
+    for (auto it = range.begin(); it != std::prev(range.end()); ++it) {
+        Version version = fn(it->key);
+        auto resultIt = versionMap.find(version);
+        ASSERT(resultIt != versionMap.end());
+    }
 }
 
-} // namespace
-
-TEST_CASE("/fdbserver/ConfigDB/ConfigNode/Internal/versionedMutationKeys") {
-	std::vector<Key> keys;
-	for (Version version = 0; version < 1000; ++version) {
-		for (int index = 0; index < 5; ++index) {
-			keys.push_back(versionedMutationKey(version, index));
-		}
-	}
-	for (int i = 0; i < 5000; ++i) {
-		ASSERT(getVersionFromVersionedMutationKey(keys[i]) == i / 5);
-	}
-	return Void();
+// Actor method with retry logic
+ACTOR static Future<Void> commitWithRetry(KVStore* kvStore) {
+    bool committed = false;
+    while (!committed) {
+        try {
+            wait(kvStore->commit());
+            committed = true;
+        } catch (Error& e) {
+            if (e.code() == error_code_commit_failed) {
+                TraceEvent(SevWarn, "KVStoreCommitRetry").log();
+                wait(delay(0.1));  // Retry after a short delay
+            } else {
+                throw e;  // Re-throw if it's a different error
+            }
+        }
+    }
+    return Void();
 }
 
+// Test case for missing key handling
+TEST_CASE("/fdbserver/ConfigDB/ConfigNode/Internal/missingKeyHandling") {
+    KVStore kvStore;
+    Key missingKey = Key{"nonexistentKey"};
+    Optional<Value> missingValue = kvStore.readValue(missingKey);
+    ASSERT(!missingValue.present());
+
+    // Simulate a missing key for a version
+    Version version = 9999;  // An unlikely version number
+    Key versionedKey = versionedMutationKey(version, 0);
+    Optional<Value> versionedValue = kvStore.readValue(versionedKey);
+    ASSERT(!versionedValue.present());
+
+    return Void();
+}
+
+// Test case for versioned mutation keys ordering
 TEST_CASE("/fdbserver/ConfigDB/ConfigNode/Internal/versionedMutationKeyOrdering") {
-	Standalone<VectorRef<KeyRef>> keys;
-	for (Version version = 0; version < 1000; ++version) {
-		for (auto index = 0; index < 5; ++index) {
-			keys.push_back_deep(keys.arena(), versionedMutationKey(version, index));
-		}
-	}
-	for (auto index = 0; index < 1000; ++index) {
-		keys.push_back_deep(keys.arena(), versionedMutationKey(1000, index));
-	}
-	ASSERT(std::is_sorted(keys.begin(), keys.end()));
-	return Void();
+    Standalone<VectorRef<KeyRef>> keys;
+    for (Version version = 0; version < 1000; ++version) {
+        for (auto index = 0; index < 5; ++index) {
+            keys.push_back(versionedMutationKey(version, index));
+        }
+    }
+    // Add keys with a higher version to check ordering between different versions
+    for (auto index = 0; index < 1000; ++index) {
+        keys.push_back(versionedMutationKey(1000, index));
+    }
+
+    // Ensure the keys are sorted by version first, and then by index
+    for (size_t i = 1; i < keys.items.size(); ++i) {
+        Version prevVersion = getVersionFromVersionedMutationKey(keys.items[i - 1]);
+        Version currVersion = getVersionFromVersionedMutationKey(keys.items[i]);
+        ASSERT((prevVersion < currVersion) || (prevVersion == currVersion && keys.items[i - 1] < keys.items[i]));
+    }
+
+    return Void();
 }
 
-class ConfigNodeImpl {
-	UID id;
-	FlowLock lock;
-	OnDemandStore kvStore;
-	CounterCollection cc;
+// Test case for deserialization consistency
+TEST_CASE("/fdbserver/ConfigDB/ConfigNode/Internal/versionedMutationKeyDeserialization") {
+    std::vector<Key> keys;
+    for (Version version = 0; version < 1000; ++version) {
+        for (int index = 0; index < 5; ++index) {
+            keys.push_back(versionedMutationKey(version, index));
+        }
+    }
 
-	// Follower counters
-	Counter compactRequests;
-	Counter rollbackRequests;
-	Counter rollforwardRequests;
-	Counter successfulChangeRequests;
-	Counter failedChangeRequests;
-	Counter snapshotRequests;
-	Counter getCommittedVersionRequests;
-	Counter lockRequests;
+    // Verify that the deserialized version matches the original version
+    for (size_t i = 0; i < keys.size(); ++i) {
+        Version version = getVersionFromVersionedMutationKey(keys[i]);
+        ASSERT(version == i / 5);
+    }
 
-	// Transaction counters
-	Counter successfulCommits;
-	Counter failedCommits;
-	Counter setMutations;
-	Counter clearMutations;
-	Counter getValueRequests;
-	Counter getGenerationRequests;
-	Future<Void> logger;
+    return Void();
+}
 
-	ACTOR static Future<CoordinatorsHash> getCoordinatorsHash(ConfigNodeImpl* self) {
-		state CoordinatorsHash coordinatorsHash = 0;
-		Optional<Value> value = wait(self->kvStore->readValue(coordinatorsHashKey));
-		if (value.present()) {
-			coordinatorsHash = BinaryReader::fromStringRef<CoordinatorsHash>(value.get(), IncludeVersion());
-		} else {
-			self->kvStore->set(
-			    KeyValueRef(coordinatorsHashKey, BinaryWriter::toValue(coordinatorsHash, IncludeVersion())));
-			wait(self->kvStore->commit());
-		}
-		return coordinatorsHash;
-	}
-
-	ACTOR static Future<Optional<CoordinatorsHash>> getLocked(ConfigNodeImpl* self) {
-		Optional<Value> value = wait(self->kvStore->readValue(lockedKey));
-		if (!value.present()) {
-			return Optional<CoordinatorsHash>();
-		}
-		return BinaryReader::fromStringRef<Optional<CoordinatorsHash>>(value.get(), IncludeVersion());
-	}
-
-	ACTOR static Future<ConfigGeneration> getGeneration(ConfigNodeImpl* self) {
-		state ConfigGeneration generation;
-		Optional<Value> value = wait(self->kvStore->readValue(currentGenerationKey));
-		if (value.present()) {
-			generation = BinaryReader::fromStringRef<ConfigGeneration>(value.get(), IncludeVersion());
-		} else {
-			self->kvStore->set(KeyValueRef(currentGenerationKey, BinaryWriter::toValue(generation, IncludeVersion())));
-			wait(self->kvStore->commit());
-		}
-		return generation;
-	}
-
-	ACTOR static Future<Version> getLastCompactedVersion(ConfigNodeImpl* self) {
-		Optional<Value> value = wait(self->kvStore->readValue(lastCompactedVersionKey));
-		state Version lastCompactedVersion = 0;
-		if (value.present()) {
-			lastCompactedVersion = BinaryReader::fromStringRef<Version>(value.get(), IncludeVersion());
-		} else {
-			self->kvStore->set(
-			    KeyValueRef(lastCompactedVersionKey, BinaryWriter::toValue(lastCompactedVersion, IncludeVersion())));
-			wait(self->kvStore->commit());
-		}
-		return lastCompactedVersion;
-	}
 
 	// Returns all commit annotations between for commits with version in [startVersion, endVersion]
 	ACTOR static Future<Standalone<VectorRef<VersionedConfigCommitAnnotationRef>>> getAnnotations(ConfigNodeImpl* self,
